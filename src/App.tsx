@@ -117,23 +117,73 @@ function SharedScreen({ track }: { track: Track }) {
 }
 
 
-function RemoteAudioOutput({track,volume}:{track:Track;volume:number}) {
-  const audioRef=useRef<HTMLAudioElement>(null);
-  useEffect(()=>{
-    const element=audioRef.current;
-    if(!element)return;
-    track.attach(element);
-    element.autoplay=true;
-    element.play().catch(()=>{});
-    return()=>{track.detach(element);};
-  },[track]);
-  useEffect(()=>{if(audioRef.current)audioRef.current.volume=volume/100;},[volume]);
-  return <audio ref={audioRef} className="watchtogether-remote-audio" autoPlay />;
+function RemoteAudioOutput({
+  track,
+  volume,
+  onAudioContext,
+}: {
+  track: Track;
+  volume: number;
+  onAudioContext: (
+  context: AudioContext | null,
+  previous?: AudioContext
+) => void;
+}) {
+  const contextRef = useRef<AudioContext | null>(null);
+  const gainRef = useRef<GainNode | null>(null);
+
+  useEffect(() => {
+    let context: AudioContext | null = null;
+
+    try {
+      const AudioContextClass =
+        window.AudioContext ||
+        (window as any).webkitAudioContext;
+
+      if (!AudioContextClass || !track.mediaStreamTrack) return;
+
+      context = new AudioContextClass();
+      const source = context.createMediaStreamSource(
+        new MediaStream([track.mediaStreamTrack])
+      );
+      const gain = context.createGain();
+
+      gain.gain.value = volume / 100;
+      source.connect(gain);
+      gain.connect(context.destination);
+
+      contextRef.current = context;
+      gainRef.current = gain;
+      onAudioContext(context);
+    } catch (error) {
+      console.warn('Não foi possível inicializar o áudio Web:', error);
+    }
+
+    return () => {
+      onAudioContext(null, context || undefined);
+      gainRef.current = null;
+      contextRef.current = null;
+      context?.close().catch(() => {});
+    };
+  }, [track]);
+
+  useEffect(() => {
+    if (gainRef.current) {
+      gainRef.current.gain.setTargetAtTime(
+        volume / 100,
+        contextRef.current?.currentTime || 0,
+        0.03
+      );
+    }
+  }, [volume]);
+
+  return null;
 }
 
 function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>void}) {
 
   const room = useRoomContext(); const participants = useParticipants(); const {localParticipant}=useLocalParticipant();
+  
 
   const [messages,setMessages]=useState<ChatMessage[]>([]);
   const [draft,setDraft]=useState('');
@@ -159,6 +209,10 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
   const chatEnd=useRef<HTMLDivElement>(null);
   const stageRef=useRef<HTMLDivElement>(null);
   const player=useRef<any>(null);
+  const audioContexts = useRef<Set<AudioContext>>(new Set());
+  const clockOffsetMs = useRef(0);
+const pendingPings = useRef(new Map<string, number>());
+const syncRateTimer = useRef<number | null>(null);
   const [expanded,setExpanded]=useState(false);
   const [nativeFullscreen,setNativeFullscreen]=useState(false);
   const connection=useConnectionState();
@@ -168,6 +222,29 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
     const handler=(payload:Uint8Array, participant?:any)=>{
       try {
         const data=JSON.parse(new TextDecoder().decode(payload));
+        // O anfitrião responde com o horário em que recebeu o ping.
+if (data.type === 'clock-ping' && isHostRef.current) {
+  send({
+    type: 'clock-pong',
+    pingId: data.pingId,
+    hostTime: Date.now(),
+  });
+  return;
+}
+
+// O participante estima a diferença entre seu relógio e o do anfitrião.
+if (data.type === 'clock-pong' && !isHostRef.current) {
+  const receivedAt = Date.now();
+  const sentAt = pendingPings.current.get(data.pingId);
+
+  if (sentAt !== undefined) {
+    const midpoint = (sentAt + receivedAt) / 2;
+    clockOffsetMs.current = Number(data.hostTime) - midpoint;
+    pendingPings.current.delete(data.pingId);
+  }
+
+  return;
+}
         if(data.type==='chat') { setMessages(m=>[...m,data.message]); return; }
         if(data.type==='video') {
           latestControl.current=null;
@@ -202,6 +279,35 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
     return()=>{room.off(RoomEvent.DataReceived,handler);};
   },[room,participants]);
 
+  useEffect(() => {
+  if (isHost) return;
+
+  const sendPing = () => {
+    const pingId = crypto.randomUUID();
+    pendingPings.current.set(pingId, Date.now());
+
+    send({
+      type: 'clock-ping',
+      pingId,
+    });
+
+    // Evita acumular pings sem resposta.
+    if (pendingPings.current.size > 10) {
+      const oldest = pendingPings.current.keys().next().value;
+      if (oldest) pendingPings.current.delete(oldest);
+    }
+  };
+
+  sendPing();
+
+  const interval = window.setInterval(sendPing, 5000);
+
+  return () => {
+    window.clearInterval(interval);
+    pendingPings.current.clear();
+  };
+}, [isHost, room]);
+
   useEffect(()=>{chatEnd.current?.scrollIntoView({behavior:'smooth'});},[messages]);
 
   useEffect(()=>{const sync=()=>setNativeFullscreen(Boolean(document.fullscreenElement));document.addEventListener('fullscreenchange',sync);return()=>document.removeEventListener('fullscreenchange',sync);},[]);
@@ -218,19 +324,79 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
 
   }
 
-  function applyRemoteYouTubeControl(data:any) {
-    const yt=player.current;
-    if(!yt || !playerReady.current || isHostRef.current) return;
-    const elapsed=data.playing && data.sentAt ? Math.max(0,(Date.now()-Number(data.sentAt))/1000) : 0;
-    const target=Math.max(0,Number(data.time || 0)+elapsed);
-    const current=Number(yt.getCurrentTime?.() || 0);
-    const state=yt.getPlayerState?.();
-    if(Math.abs(current-target)>1.8 && state!==3) yt.seekTo(target,true);
-    if(data.playing) {
-      if(state!==1 && state!==3) yt.playVideo?.();
-    } else if(state===1 || state===3) yt.pauseVideo?.();
-    if(data.ended) yt.pauseVideo?.();
+  function applyRemoteYouTubeControl(data: any) {
+  const yt = player.current;
+
+  if (!yt || !playerReady.current || isHostRef.current) return;
+
+  const hostNow = Date.now() + clockOffsetMs.current;
+
+  const elapsed =
+    data.playing && data.sentAt
+      ? Math.max(0, (hostNow - Number(data.sentAt)) / 1000)
+      : 0;
+
+  const target = Math.max(0, Number(data.time || 0) + elapsed);
+  const current = Number(yt.getCurrentTime?.() || 0);
+  const state = yt.getPlayerState?.();
+  const difference = target - current;
+  const absoluteDifference = Math.abs(difference);
+
+  // Diferenças grandes: corrigir a posição uma única vez.
+  if (absoluteDifference > 1.5 && state !== 3) {
+    if (syncRateTimer.current !== null) {
+      window.clearTimeout(syncRateTimer.current);
+      syncRateTimer.current = null;
+    }
+
+    yt.setPlaybackRate?.(1);
+    yt.seekTo?.(target, true);
   }
+
+  // Diferenças pequenas: corrigir gradualmente a velocidade.
+  else if (
+    absoluteDifference > 0.35 &&
+    absoluteDifference <= 1.5 &&
+    data.playing &&
+    state === 1
+  ) {
+    const currentRate = Number(yt.getPlaybackRate?.() || 1);
+
+    if (currentRate === 1) {
+      yt.setPlaybackRate?.(difference > 0 ? 1.05 : 0.95);
+
+      if (syncRateTimer.current !== null) {
+        window.clearTimeout(syncRateTimer.current);
+      }
+
+      syncRateTimer.current = window.setTimeout(() => {
+        yt.setPlaybackRate?.(1);
+        syncRateTimer.current = null;
+      }, 1500);
+    }
+  }
+
+  if (data.playing) {
+    if (state !== 1 && state !== 3) {
+      yt.playVideo?.();
+    }
+  } else {
+    if (syncRateTimer.current !== null) {
+      window.clearTimeout(syncRateTimer.current);
+      syncRateTimer.current = null;
+    }
+
+    yt.setPlaybackRate?.(1);
+
+    if (state === 1 || state === 3) {
+      yt.pauseVideo?.();
+    }
+  }
+
+  if (data.ended) {
+    yt.pauseVideo?.();
+  }
+}
 
   useEffect(()=>{
     if(!videoId) return;
@@ -279,7 +445,6 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
 
   useEffect(()=>{
     volumeRef.current=volume;
-    document.querySelectorAll<HTMLAudioElement>('.watchtogether-remote-audio').forEach(el=>{el.volume=volume/100;});
     try {
       player.current?.setVolume?.(volume);
       if(volume===0) player.current?.mute?.(); else player.current?.unMute?.();
@@ -292,7 +457,7 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
       const yt=player.current;
       if(!yt || !playerReady.current) return;
       const state=yt.getPlayerState?.();
-      send({type:'control',playing:state===1||state===3,ended:state===0,time:Number(yt.getCurrentTime?.()||0),videoId,sentAt:Date.now(),heartbeat:true});
+      send({type:'control',playing:state===1,ended:state===0,time:Number(yt.getCurrentTime?.()||0),videoId,sentAt:Date.now(),heartbeat:true});
     },1000);
     return()=>window.clearInterval(interval);
   },[isHost,videoId,room]);
@@ -377,16 +542,50 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
   const remoteScreen=participants.flatMap(p=>[...p.trackPublications.values()].filter(pub=>pub.source===Track.Source.ScreenShare&&pub.track).map(pub=>({p,pub})));
 
   const localScreen=screenTrack;
-  const remoteAudioTracks=participants
-    .filter(participant=>participant.identity!==localParticipant.identity)
-    .flatMap(participant=>[...participant.trackPublications.values()]
-      .filter(publication=>publication.kind===Track.Kind.Audio && publication.isSubscribed && publication.track && !publication.isMuted)
-      .map(publication=>({key:publication.trackSid || publication.track!.sid,track:publication.track!})));
+  const remoteAudioTracks = participants
+  .filter(participant => participant.identity !== localParticipant.identity)
+  .flatMap(participant =>
+    [...participant.trackPublications.values()]
+      .filter(publication =>
+        publication.kind === Track.Kind.Audio &&
+        publication.isSubscribed &&
+        publication.track &&
+        !publication.isMuted
+      )
+      .map(publication => ({
+        key: publication.trackSid || publication.track!.sid,
+        track: publication.track!,
+      }))
+  );
 
+      function activateLocalAudio() {
+  audioContexts.current.forEach(context => {
+    if (context.state === 'suspended') {
+      context.resume().catch(error => {
+        console.warn('Não foi possível ativar o áudio:', error);
+      });
+    }
+  });
+}
 
   return <div className="room-shell">
     <div className="remote-audio-output" aria-hidden="true">
-      {remoteAudioTracks.map(item=><RemoteAudioOutput key={item.key} track={item.track} volume={volume}/>)}
+      {remoteAudioTracks.map(item => (
+  <RemoteAudioOutput
+    key={item.key}
+    track={item.track}
+    volume={volume}
+    onAudioContext={(context, previous) => {
+  if (context) {
+    audioContexts.current.add(context);
+  }
+
+  if (previous) {
+    audioContexts.current.delete(previous);
+  }
+}}
+  />
+))}
     </div><header className="room-header"><div className="brand"><span className="brand-icon"><Clapperboard size={19}/></span>watch<span>together</span></div><div className="room-meta"><span className="live-dot"/> SALA PRIVADA <b>{credentials.roomName}</b></div><div className="header-actions"><button className="ghost" onClick={copyInvite}><Copy size={16}/>{copied?'Copiado!':'Convidar'}</button><button className="leave" onClick={onLeave}><LogOut size={16}/> Sair</button></div></header>
 
   {connection!==ConnectionState.Connected&&<div className={`connection-banner ${connection===ConnectionState.Disconnected?'failed':''}`}><span>{connection===ConnectionState.Disconnected?'Não foi possível conectar ao servidor de mídia. Confira o LIVEKIT_URL no server/.env.':'Conectando ao servidor de mídia...'}</span>{connection===ConnectionState.Disconnected&&<button onClick={()=>{setReconnectError('');room.connect(credentials.serverUrl,credentials.token).catch(e=>setReconnectError(e instanceof Error?e.message:'Falha ao reconectar.'));}}>Tentar novamente</button>}{reconnectError&&<small>{reconnectError}</small>}</div>}<main className="room-layout"><section className="watch-area"><div ref={stageRef} className={`stage${expanded?' expanded':''}`}>
@@ -397,7 +596,19 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
 
     </div>
 
-    <div className="toolbar"><div className="toolbar-left"><span className={`connection ${connection===ConnectionState.Connected?'ok':''}`}/><span>{connection===ConnectionState.Connected?'Conectado': 'Conectando...'}</span><span className="divider-v"/><Users size={15}/><span>{participants.length}/10</span></div><div className="toolbar-right">{screenOn?<button className="danger" onClick={stopScreen}><X size={16}/> Parar compartilhamento</button>:<button className="control" onClick={shareScreen}><MonitorUp size={17}/> Compartilhar tela</button>}<label className="local-volume" title="Volume somente neste dispositivo"><Volume2 size={16}/><input aria-label="Volume local" type="range" min={0} max={100} value={volume} onChange={e=>setVolume(Number(e.target.value))}/><span>{volume}%</span></label><span className="audio-status">Áudio local</span></div></div>
+    <div className="toolbar"><div className="toolbar-left"><span className={`connection ${connection===ConnectionState.Connected?'ok':''}`}/><span>{connection===ConnectionState.Connected?'Conectado': 'Conectando...'}</span><span className="divider-v"/><Users size={15}/><span>{participants.length}/10</span></div><div className="toolbar-right">{screenOn?<button className="danger" onClick={stopScreen}><X size={16}/> Parar compartilhamento</button>:<button className="control" onClick={shareScreen}><MonitorUp size={17}/> Compartilhar tela</button>}<label className="local-volume" title="Volume somente neste dispositivo"><Volume2 size={16}/><input
+  aria-label="Volume local"
+  type="range"
+  min={0}
+  max={100}
+  value={volume}
+  onPointerDown={activateLocalAudio}
+  onTouchStart={activateLocalAudio}
+  onChange={e => {
+    activateLocalAudio();
+    setVolume(Number(e.target.value));
+  }}
+/><span>{volume}%</span></label><span className="audio-status">Áudio local</span></div></div>
 
     <div className="link-panel"><div className="link-title"><Play size={16}/> <b>Assistir por link</b><small>YouTube sincronizado</small></div><div className="link-input"><input id="video-link" value={url} onChange={e=>setUrl(e.target.value)} onKeyDown={e=>e.key==='Enter'&&addVideo()} placeholder="Cole o link do YouTube aqui..."/><button className="primary" onClick={addVideo}>Adicionar</button></div>{notice&&<div className="notice">{notice}</div>}</div>
 
