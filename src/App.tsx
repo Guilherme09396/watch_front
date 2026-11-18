@@ -44,11 +44,40 @@ export default function App() {
     <div className="features"><div><MonitorUp/><b>Compartilhe sua tela</b><small>Com áudio quando suportado</small></div><div><Play/><b>Vídeos sincronizados</b><small>YouTube e links compatíveis</small></div><div><Users/><b>Até 10 pessoas</b><small>Uma sala só de vocês</small></div></div></section><footer>WATCHTOGETHER <span>•</span> FEITO PARA ASSISTIR JUNTO</footer></main>;
 }
 
-function SharedScreen({track}:{track:Track}) {
-  const ref=useRef<HTMLVideoElement>(null);
-  useEffect(()=>{const el=ref.current;if(!el)return;track.attach(el);return()=>{track.detach(el);};},[track]);
-  return <video ref={ref} className="screen-video" autoPlay playsInline />;
+
+async function shareScreen() {
+  try {
+    const tracks = await createLocalScreenTracks({
+      audio: true,
+      video: {
+        displaySurface: 'monitor'
+      }
+    });
+
+    for (const track of tracks) {
+      await localParticipant.publishTrack(track, {
+        source: track.source
+      });
+    }
+
+    setScreenTrack(
+      tracks.find(track => track.kind === Track.Kind.Video) || null
+    );
+
+    setScreenOn(true);
+
+    send({
+      type: 'system',
+      text: `${credentials.participantName} começou a compartilhar a tela.`
+    });
+  } catch (e) {
+    console.error('Erro ao compartilhar tela:', e);
+    setNotice(
+      'Não foi possível compartilhar. Verifique as permissões do navegador.'
+    );
+  }
 }
+
 function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>void}) {
   const room = useRoomContext(); const participants = useParticipants(); const {localParticipant}=useLocalParticipant();
   const [messages,setMessages]=useState<ChatMessage[]>([]); const [draft,setDraft]=useState(''); const [url,setUrl]=useState(''); const [videoId,setVideoId]=useState(''); const [playing,setPlaying]=useState(false); const [notice,setNotice]=useState(''); const [screenOn,setScreenOn]=useState(false); const [screenTrack,setScreenTrack]=useState<Track|null>(null); const [copied,setCopied]=useState(false);
