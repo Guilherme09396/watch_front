@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { LiveKitRoom, RoomAudioRenderer, useConnectionState, useLocalParticipant, useParticipants, useRoomContext } from '@livekit/components-react';
-import { ConnectionState, RoomEvent, Track, createLocalScreenTracks, type RemoteTrack } from 'livekit-client';
+import { ConnectionState, RoomEvent, Track, createLocalScreenTracks } from 'livekit-client';
 import { Copy, Link2, LogOut, MonitorUp, Play, Send, Users, Volume2, Film, MessageCircle, Crown, ShieldCheck, Clapperboard, X } from 'lucide-react';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 type Credentials = { token:string; serverUrl:string; roomName:string; participantName:string; isHost:boolean };
 type ChatMessage = { id:string; name:string; text:string; time:string; system?:boolean };
-const randomRoom = () => 'wt-' + crypto.randomUUID().replaceAll('-','').slice(0,12);
+const randomRoom = () => 'wt-' + crypto.randomUUID().replace(/-/g, '').slice(0, 12);
 const roomFromUrl = () => new URLSearchParams(location.search).get('room') || '';
 
 export default function App() {
@@ -40,7 +40,7 @@ export default function App() {
     <div className="features"><div><MonitorUp/><b>Compartilhe sua tela</b><small>Com áudio quando suportado</small></div><div><Play/><b>Vídeos sincronizados</b><small>YouTube e links compatíveis</small></div><div><Users/><b>Até 10 pessoas</b><small>Uma sala só de vocês</small></div></div></section><footer>WATCHTOGETHER <span>•</span> FEITO PARA ASSISTIR JUNTO</footer></main>;
 }
 
-function SharedScreen({track}:{track:RemoteTrack}) {
+function SharedScreen({track}:{track:Track}) {
   const ref=useRef<HTMLVideoElement>(null);
   useEffect(()=>{const el=ref.current;if(!el)return;track.attach(el);return()=>{track.detach(el);};},[track]);
   return <video ref={ref} className="screen-video" autoPlay playsInline />;
@@ -57,7 +57,12 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
   function send(data:any){room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(data)),{reliable:true});}
   function sendChat(){const text=draft.trim();if(!text)return;const message={id:crypto.randomUUID(),name:credentials.participantName,text,time:new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})};setMessages(m=>[...m,message]);send({type:'chat',message});setDraft('');}
   function addVideo(){const match=url.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);if(!match){setNotice('Insira um link válido do YouTube. Para outros players, use Compartilhar tela.');return;}setVideoId(match[1]);setPlaying(false);send({type:'video',videoId:match[1],url});setNotice('Vídeo enviado para a sala. O anfitrião controla a reprodução.');}
-  async function shareScreen(){try{const tracks=await createLocalScreenTracks({audio:true,video:{resolution:{width:1920,height:1080},frameRate:30}});for(const t of tracks)await localParticipant.publishTrack(t,{source:t.source});setScreenTrack(tracks.find(t=>t.kind===Track.Kind.Video)||null);setScreenOn(true);send({type:'system',text:`${credentials.participantName} começou a compartilhar a tela.`});}catch(e){setNotice('Não foi possível compartilhar. Use Chrome/Edge no computador e permita o acesso à tela e ao áudio.');}}
+  async function shareScreen(){try{const tracks = await createLocalScreenTracks({
+  audio: true,
+  video: {
+    displaySurface: 'browser'
+  }
+});for(const t of tracks)await localParticipant.publishTrack(t,{source:t.source});setScreenTrack(tracks.find(t=>t.kind===Track.Kind.Video)||null);setScreenOn(true);send({type:'system',text:`${credentials.participantName} começou a compartilhar a tela.`});}catch(e){setNotice('Não foi possível compartilhar. Use Chrome/Edge no computador e permita o acesso à tela e ao áudio.');}}
   async function stopScreen(){if(!screenOn)return;for(const p of localParticipant.trackPublications.values()){if(p.source===Track.Source.ScreenShare||p.source===Track.Source.ScreenShareAudio){p.track?.stop();await localParticipant.unpublishTrack(p.track!);}}setScreenOn(false);setScreenTrack(null);}
   async function copyInvite(){await navigator.clipboard.writeText(`${location.origin}${location.pathname}?room=${credentials.roomName}`);setCopied(true);setTimeout(()=>setCopied(false),1800);}
   const remoteScreen=participants.flatMap(p=>[...p.trackPublications.values()].filter(pub=>pub.source===Track.Source.ScreenShare&&pub.track).map(pub=>({p,pub})));
