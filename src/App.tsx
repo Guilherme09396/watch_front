@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-import { LiveKitRoom, RoomAudioRenderer, useConnectionState, useLocalParticipant, useParticipants, useRoomContext } from '@livekit/components-react';
+import { LiveKitRoom, useConnectionState, useLocalParticipant, useParticipants, useRoomContext } from '@livekit/components-react';
 
 import { ConnectionState, RoomEvent, Track, createLocalScreenTracks } from 'livekit-client';
 
@@ -76,7 +76,7 @@ export default function App() {
 
   }
 
-  if (credentials) return <LiveKitRoom serverUrl={credentials.serverUrl} token={credentials.token} connect audio video options={{adaptiveStream:true,dynacast:true}}><RoomAudioRenderer/><WatchRoom credentials={credentials} onLeave={()=>{setCredentials(null);history.replaceState({},'',location.pathname);}}/></LiveKitRoom>;
+  if (credentials) return <LiveKitRoom serverUrl={credentials.serverUrl} token={credentials.token} connect audio video options={{adaptiveStream:true,dynacast:true}}><WatchRoom credentials={credentials} onLeave={()=>{setCredentials(null);history.replaceState({},'',location.pathname);}}/></LiveKitRoom>;
 
   return <main className="landing"><nav className="topbar"><div className="brand"><span className="brand-icon"><Clapperboard size={21}/></span>watch<span>together</span></div><div className="secure"><ShieldCheck size={15}/> Salas privadas</div></nav>
 
@@ -116,43 +116,93 @@ function SharedScreen({ track }: { track: Track }) {
   );
 }
 
+
+function RemoteAudioOutput({track,volume}:{track:Track;volume:number}) {
+  const audioRef=useRef<HTMLAudioElement>(null);
+  useEffect(()=>{
+    const element=audioRef.current;
+    if(!element)return;
+    track.attach(element);
+    element.autoplay=true;
+    element.play().catch(()=>{});
+    return()=>{track.detach(element);};
+  },[track]);
+  useEffect(()=>{if(audioRef.current)audioRef.current.volume=volume/100;},[volume]);
+  return <audio ref={audioRef} className="watchtogether-remote-audio" autoPlay />;
+}
+
 function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>void}) {
 
   const room = useRoomContext(); const participants = useParticipants(); const {localParticipant}=useLocalParticipant();
 
-  const [messages,setMessages]=useState<ChatMessage[]>([]); const [draft,setDraft]=useState(''); const [url,setUrl]=useState(''); const [videoId,setVideoId]=useState(''); const [playing,setPlaying]=useState(false); const [notice,setNotice]=useState(''); const [screenOn,setScreenOn]=useState(false); const [screenTrack,setScreenTrack]=useState<Track|null>(null); const [copied,setCopied]=useState(false); const [volume,setVolume]=useState(100); const latestControl=useRef<any>(null); const playerReady=useRef(false);
-
-  const chatEnd=useRef<HTMLDivElement>(null); const stageRef=useRef<HTMLDivElement>(null); const player=useRef<any>(null); const [expanded,setExpanded]=useState(false); const [nativeFullscreen,setNativeFullscreen]=useState(false); const isHost=credentials.isHost || room.localParticipant.identity===participants[0]?.identity;
-
-  const connection=useConnectionState(); const [reconnectError,setReconnectError]=useState('');
+  const [messages,setMessages]=useState<ChatMessage[]>([]);
+  const [draft,setDraft]=useState('');
+  const [url,setUrl]=useState('');
+  const [videoId,setVideoId]=useState('');
+  const [playing,setPlaying]=useState(false);
+  const [notice,setNotice]=useState('');
+  const [screenOn,setScreenOn]=useState(false);
+  const [screenTrack,setScreenTrack]=useState<Track|null>(null);
+  const [copied,setCopied]=useState(false);
+  const [volume,setVolume]=useState(100);
+  const [needsPlaybackGesture,setNeedsPlaybackGesture]=useState(false);
+  const latestControl=useRef<any>(null);
+  const playerReady=useRef(false);
+  const volumeRef=useRef(100);
+  const videoIdRef=useRef('');
+  const hostIdentityRef=useRef<string|null>(credentials.isHost ? room.localParticipant.identity : null);
+  const isHost=credentials.isHost;
+  const isHostRef=useRef(isHost);
+  isHostRef.current=isHost;
+  volumeRef.current=volume;
+  videoIdRef.current=videoId;
+  const chatEnd=useRef<HTMLDivElement>(null);
+  const stageRef=useRef<HTMLDivElement>(null);
+  const player=useRef<any>(null);
+  const [expanded,setExpanded]=useState(false);
+  const [nativeFullscreen,setNativeFullscreen]=useState(false);
+  const connection=useConnectionState();
+  const [reconnectError,setReconnectError]=useState('');
 
   useEffect(()=>{
-    const handler=(payload:Uint8Array)=>{
+    const handler=(payload:Uint8Array, participant?:any)=>{
       try {
         const data=JSON.parse(new TextDecoder().decode(payload));
-        if(data.type==='chat') setMessages(m=>[...m,data.message]);
-        if(data.type==='video'){latestControl.current=null;setVideoId(data.videoId);setUrl(data.url);setPlaying(false);}
-        if(data.type==='control' && data.videoId===videoId){
-          latestControl.current=data;setPlaying(Boolean(data.playing));
-          const yt=player.current;
-          if(yt && playerReady.current){
-            const elapsed=data.playing&&data.sentAt?Math.max(0,(Date.now()-data.sentAt)/1000):0;
-            const target=Number(data.time||0)+elapsed;
-            const current=Number(yt.getCurrentTime?.()||0);
-            if(Math.abs(current-target)>1.25) yt.seekTo?.(target,true);
-            const state=yt.getPlayerState?.();
-            if(data.playing && state!==1) yt.playVideo?.();
-            if(!data.playing && state!==2 && state!==0) yt.pauseVideo?.();
+        if(data.type==='chat') { setMessages(m=>[...m,data.message]); return; }
+        if(data.type==='video') {
+          latestControl.current=null;
+          setNeedsPlaybackGesture(false);
+          if(participant?.identity) hostIdentityRef.current=participant.identity;
+          if(data.videoId===videoIdRef.current && playerReady.current) {
+            player.current?.pauseVideo?.();
+            player.current?.seekTo?.(0,true);
           }
+          setVideoId(data.videoId);
+          videoIdRef.current=data.videoId;
+          setUrl(data.url || '');
+          setPlaying(false);
+          return;
         }
-        if(data.type==='system') setMessages(m=>[...m,{id:crypto.randomUUID(),name:'WatchTogether',text:data.text,time:new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),system:true}]);
+        if(data.type==='control' && data.videoId===videoIdRef.current && !isHostRef.current) {
+          if(participant?.identity) {
+            if(!hostIdentityRef.current) hostIdentityRef.current=participant.identity;
+            if(participant.identity!==hostIdentityRef.current) return;
+          }
+          latestControl.current=data;
+          setPlaying(Boolean(data.playing));
+          applyRemoteYouTubeControl(data);
+          return;
+        }
+        if(data.type==='system') {
+          setMessages(m=>[...m,{id:crypto.randomUUID(),name:'WatchTogether',text:data.text,time:new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),system:true}]);
+        }
       } catch(error) { console.warn('Mensagem da sala inválida:',error); }
     };
     room.on(RoomEvent.DataReceived,handler);
     return()=>{room.off(RoomEvent.DataReceived,handler);};
-  },[room,videoId]);
+  },[room,participants]);
 
-  useEffect(()=>{chatEnd.current?.scrollIntoView({behavior:'smooth'});},[messages]);
+  useEffect(()=>{chatEnd.current?.scrollIntoView({behavior:'smooth'});},[messages]);
 
   useEffect(()=>{const sync=()=>setNativeFullscreen(Boolean(document.fullscreenElement));document.addEventListener('fullscreenchange',sync);return()=>document.removeEventListener('fullscreenchange',sync);},[]);
 
@@ -168,70 +218,109 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
 
   }
 
+  function applyRemoteYouTubeControl(data:any) {
+    const yt=player.current;
+    if(!yt || !playerReady.current || isHostRef.current) return;
+    const elapsed=data.playing && data.sentAt ? Math.max(0,(Date.now()-Number(data.sentAt))/1000) : 0;
+    const target=Math.max(0,Number(data.time || 0)+elapsed);
+    const current=Number(yt.getCurrentTime?.() || 0);
+    const state=yt.getPlayerState?.();
+    if(Math.abs(current-target)>1.8 && state!==3) yt.seekTo(target,true);
+    if(data.playing) {
+      if(state!==1 && state!==3) yt.playVideo?.();
+    } else if(state===1 || state===3) yt.pauseVideo?.();
+    if(data.ended) yt.pauseVideo?.();
+  }
+
   useEffect(()=>{
-    if(!videoId)return;
+    if(!videoId) return;
     let cancelled=false;
-    const load=()=>{
-      if(cancelled || !(window as any).YT?.Player)return;
-      player.current?.destroy?.();playerReady.current=false;
-      player.current=new (window as any).YT.Player('youtube-player',{
+    const w=window as any;
+    const createPlayer=()=>{
+      if(cancelled || !w.YT?.Player) return;
+      player.current?.destroy?.();
+      playerReady.current=false;
+      player.current=new w.YT.Player('youtube-player',{
         videoId,
-        playerVars:{autoplay:0,controls:1,rel:0,playsinline:1,enablejsapi:1},
+        playerVars:{autoplay:0,controls:isHost?1:0,rel:0,playsinline:1,enablejsapi:1,origin:window.location.origin},
         events:{
           onReady:(event:any)=>{
+            if(cancelled) return;
             playerReady.current=true;
-            const initial=latestControl.current;
-            if(initial){
-              const elapsed=initial.playing&&initial.sentAt?Math.max(0,(Date.now()-initial.sentAt)/1000):0;
-              const target=Number(initial.time||0)+elapsed;
-              if(Math.abs(Number(event.target.getCurrentTime?.()||0)-target)>1.25)event.target.seekTo?.(target,true);
-              if(initial.playing)event.target.playVideo?.();else event.target.pauseVideo?.();
-            }
-            try{event.target.setVolume?.(volume);}catch{}
+            event.target.setVolume?.(volumeRef.current);
+            if(latestControl.current && !isHostRef.current) applyRemoteYouTubeControl(latestControl.current);
           },
           onStateChange:(event:any)=>{
-            if(isHost&&(event.data===1||event.data===2)){
-              const next=event.data===1;setPlaying(next);
-              send({type:'control',playing:next,time:event.target.getCurrentTime(),videoId,sentAt:Date.now()});
+            if(!isHostRef.current) return;
+            const state=event.data;
+            if(state===1 || state===2 || state===0) {
+              setPlaying(state===1);
+              send({type:'control',playing:state===1,ended:state===0,time:Number(event.target.getCurrentTime?.()||0),videoId:videoIdRef.current,sentAt:Date.now()});
             }
-          }
+          },
+          onAutoplayBlocked:()=>{ if(!isHostRef.current) setNeedsPlaybackGesture(true); }
         }
       });
     };
-    if((window as any).YT?.Player)load();
-    else{
-      let script=document.querySelector('script[data-watchtogether-youtube]') as HTMLScriptElement|null;
-      if(!script){script=document.createElement('script');script.src='https://www.youtube.com/iframe_api';script.dataset.watchtogetherYoutube='true';document.body.appendChild(script);}
-      const previous=(window as any).onYouTubeIframeAPIReady;
-      (window as any).onYouTubeIframeAPIReady=()=>{previous?.();load();};
+    if(w.YT?.Player) createPlayer();
+    else {
+      const previous=w.onYouTubeIframeAPIReady;
+      w.onYouTubeIframeAPIReady=()=>{try{previous?.();}catch{}createPlayer();};
+      let script=document.querySelector<HTMLScriptElement>('script[data-watchtogether-youtube]');
+      if(!script) {
+        script=document.createElement('script');
+        script.src='https://www.youtube.com/iframe_api';
+        script.dataset.watchtogetherYoutube='true';
+        document.head.appendChild(script);
+      }
     }
     return()=>{cancelled=true;playerReady.current=false;player.current?.destroy?.();player.current=null;};
-  },[videoId]);
+  },[videoId,isHost]);
 
-  // Volume aplicado apenas aos elementos de áudio deste navegador/dispositivo.
   useEffect(()=>{
-    const applyVolume=()=>{document.querySelectorAll('audio').forEach(element=>{(element as HTMLAudioElement).volume=volume/100;});try{player.current?.setVolume?.(volume);}catch{}};
-    applyVolume();
-    const observer=new MutationObserver(applyVolume);observer.observe(document.body,{childList:true,subtree:true});
-    return()=>observer.disconnect();
+    volumeRef.current=volume;
+    document.querySelectorAll<HTMLAudioElement>('.watchtogether-remote-audio').forEach(el=>{el.volume=volume/100;});
+    try {
+      player.current?.setVolume?.(volume);
+      if(volume===0) player.current?.mute?.(); else player.current?.unMute?.();
+    } catch {}
   },[volume,videoId]);
 
-  // Heartbeat do anfitrião: corrige diferenças de tempo e estado nos demais players.
   useEffect(()=>{
-    if(!isHost||!videoId)return;
+    if(!isHost || !videoId) return;
     const interval=window.setInterval(()=>{
-      const yt=player.current;if(!yt||!playerReady.current)return;
+      const yt=player.current;
+      if(!yt || !playerReady.current) return;
       const state=yt.getPlayerState?.();
-      send({type:'control',playing:state===1||state===3,time:Number(yt.getCurrentTime?.()||0),videoId,sentAt:Date.now(),heartbeat:true});
-    },2000);
+      send({type:'control',playing:state===1||state===3,ended:state===0,time:Number(yt.getCurrentTime?.()||0),videoId,sentAt:Date.now(),heartbeat:true});
+    },1000);
     return()=>window.clearInterval(interval);
   },[isHost,videoId,room]);
 
-  function send(data:any){room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(data)),{reliable:true});}
+  const [,setAudioRevision]=useState(0);
+  useEffect(()=>{
+    const refresh=()=>setAudioRevision(v=>v+1);
+    room.on(RoomEvent.TrackSubscribed,refresh);
+    room.on(RoomEvent.TrackUnsubscribed,refresh);
+    room.on(RoomEvent.TrackMuted,refresh);
+    room.on(RoomEvent.TrackUnmuted,refresh);
+    room.on(RoomEvent.ParticipantConnected,refresh);
+    room.on(RoomEvent.ParticipantDisconnected,refresh);
+    return()=>{
+      room.off(RoomEvent.TrackSubscribed,refresh);
+      room.off(RoomEvent.TrackUnsubscribed,refresh);
+      room.off(RoomEvent.TrackMuted,refresh);
+      room.off(RoomEvent.TrackUnmuted,refresh);
+      room.off(RoomEvent.ParticipantConnected,refresh);
+      room.off(RoomEvent.ParticipantDisconnected,refresh);
+    };
+  },[room]);
+
+  function send(data:any){room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(data)),{reliable:true});}
 
   function sendChat(){const text=draft.trim();if(!text)return;const message={id:crypto.randomUUID(),name:credentials.participantName,text,time:new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})};setMessages(m=>[...m,message]);send({type:'chat',message});setDraft('');}
 
-  function addVideo(){const match = url.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);if(!match){setNotice('Insira um link válido do YouTube. Para outros players, use Compartilhar tela.');return;}setVideoId(match[1]);setPlaying(false);send({type:'video',videoId:match[1],url});setNotice('Vídeo enviado para a sala. O anfitrião controla a reprodução.');}
+  function addVideo(){if(!isHost){setNotice('Somente o anfitrião pode escolher e controlar o vídeo.');return;}const match = url.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);if(!match){setNotice('Insira um link válido do YouTube. Para outros players, use Compartilhar tela.');return;}setVideoId(match[1]);setPlaying(false);send({type:'video',videoId:match[1],url});setNotice('Vídeo enviado para a sala. O anfitrião controla a reprodução.');}
 
   async function shareScreen(){
 
@@ -288,14 +377,23 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
   const remoteScreen=participants.flatMap(p=>[...p.trackPublications.values()].filter(pub=>pub.source===Track.Source.ScreenShare&&pub.track).map(pub=>({p,pub})));
 
   const localScreen=screenTrack;
+  const remoteAudioTracks=participants
+    .filter(participant=>participant.identity!==localParticipant.identity)
+    .flatMap(participant=>[...participant.trackPublications.values()]
+      .filter(publication=>publication.kind===Track.Kind.Audio && publication.isSubscribed && publication.track && !publication.isMuted)
+      .map(publication=>({key:publication.trackSid || publication.track!.sid,track:publication.track!})));
 
-  return <div className="room-shell"><header className="room-header"><div className="brand"><span className="brand-icon"><Clapperboard size={19}/></span>watch<span>together</span></div><div className="room-meta"><span className="live-dot"/> SALA PRIVADA <b>{credentials.roomName}</b></div><div className="header-actions"><button className="ghost" onClick={copyInvite}><Copy size={16}/>{copied?'Copiado!':'Convidar'}</button><button className="leave" onClick={onLeave}><LogOut size={16}/> Sair</button></div></header>
+
+  return <div className="room-shell">
+    <div className="remote-audio-output" aria-hidden="true">
+      {remoteAudioTracks.map(item=><RemoteAudioOutput key={item.key} track={item.track} volume={volume}/>)}
+    </div><header className="room-header"><div className="brand"><span className="brand-icon"><Clapperboard size={19}/></span>watch<span>together</span></div><div className="room-meta"><span className="live-dot"/> SALA PRIVADA <b>{credentials.roomName}</b></div><div className="header-actions"><button className="ghost" onClick={copyInvite}><Copy size={16}/>{copied?'Copiado!':'Convidar'}</button><button className="leave" onClick={onLeave}><LogOut size={16}/> Sair</button></div></header>
 
   {connection!==ConnectionState.Connected&&<div className={`connection-banner ${connection===ConnectionState.Disconnected?'failed':''}`}><span>{connection===ConnectionState.Disconnected?'Não foi possível conectar ao servidor de mídia. Confira o LIVEKIT_URL no server/.env.':'Conectando ao servidor de mídia...'}</span>{connection===ConnectionState.Disconnected&&<button onClick={()=>{setReconnectError('');room.connect(credentials.serverUrl,credentials.token).catch(e=>setReconnectError(e instanceof Error?e.message:'Falha ao reconectar.'));}}>Tentar novamente</button>}{reconnectError&&<small>{reconnectError}</small>}</div>}<main className="room-layout"><section className="watch-area"><div ref={stageRef} className={`stage${expanded?' expanded':''}`}>
 
     <button className="fullscreen-toggle" onClick={toggleStageFullscreen} title={nativeFullscreen||expanded?'Sair da tela cheia':'Expandir transmissão'} aria-label={nativeFullscreen||expanded?'Sair da tela cheia':'Expandir transmissão'}>{nativeFullscreen||expanded?<Minimize2 size={17}/>:<Maximize2 size={17}/>}</button>
 
-    {remoteScreen.length>0?<div className="screen-stage"><SharedScreen track={remoteScreen[0].pub.track!}/><div className="screen-label"><MonitorUp size={14}/> Tela de {remoteScreen[0].p.name}</div></div>:localScreen?<div className="screen-stage"><SharedScreen track={localScreen}/><div className="screen-label"><MonitorUp size={14}/> Sua tela (pré-visualização)</div></div>:videoId?<div className="youtube-wrap"><div id="youtube-player"/></div>:<div className="empty-stage"><div className="film-icon"><Film size={34}/></div><h2>O que vamos assistir hoje?</h2><p>Compartilhe sua tela ou adicione um vídeo do YouTube.</p><div className="stage-actions"><button className="primary" onClick={shareScreen}><MonitorUp size={17}/> Compartilhar tela</button><button className="secondary" onClick={()=>document.getElementById('video-link')?.focus()}><Link2 size={17}/> Adicionar link</button></div></div>}
+    {remoteScreen.length>0?<div className="screen-stage"><SharedScreen track={remoteScreen[0].pub.track!}/><div className="screen-label"><MonitorUp size={14}/> Tela de {remoteScreen[0].p.name}</div></div>:localScreen?<div className="screen-stage"><SharedScreen track={localScreen}/><div className="screen-label"><MonitorUp size={14}/> Sua tela (pré-visualização)</div></div>:videoId?<div className="youtube-wrap"><div id="youtube-player"/>{needsPlaybackGesture&&<button className="youtube-activate" onClick={()=>{setNeedsPlaybackGesture(false);try{player.current?.unMute?.();player.current?.setVolume?.(volumeRef.current);player.current?.playVideo?.();}catch{}}}>Clique para iniciar o vídeo sincronizado</button>}</div>:<div className="empty-stage"><div className="film-icon"><Film size={34}/></div><h2>O que vamos assistir hoje?</h2><p>Compartilhe sua tela ou adicione um vídeo do YouTube.</p><div className="stage-actions"><button className="primary" onClick={shareScreen}><MonitorUp size={17}/> Compartilhar tela</button><button className="secondary" onClick={()=>document.getElementById('video-link')?.focus()}><Link2 size={17}/> Adicionar link</button></div></div>}
 
     </div>
 

@@ -26,3 +26,48 @@
 .local-volume input[type=range]{width:92px;accent-color:#9c87ff;cursor:pointer}
 .local-volume span{min-width:32px;text-align:right;font-variant-numeric:tabular-nums}
 @media(max-width:520px){.toolbar-right{flex-wrap:wrap}.local-volume{flex:1;justify-content:center}.local-volume input[type=range]{width:min(34vw,110px)}.audio-status{display:none}}
+
+
+/* Saída de áudio remota: elementos invisíveis, mas reproduzidos localmente. */
+.remote-audio-output {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+  left: -10px;
+  bottom: -10px;
+}
+.watchtogether-remote-audio {
+  width: 1px;
+  height: 1px;
+}
+
+/* Aviso acionável quando o navegador bloqueia autoplay com áudio. */
+.youtube-wrap {
+  position: relative;
+}
+.youtube-activate {
+  position: absolute;
+  z-index: 7;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  max-width: calc(100% - 32px);
+  padding: 13px 18px;
+  border: 1px solid #ffffff30;
+  border-radius: 10px;
+  background: #795cff;
+  color: #fff;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 8px 30px #0008;
+}
+.youtube-activate:hover {
+  background: #8d75ff;
+}
+.local-volume input[type="range"] {
+  touch-action: pan-y;
+}
