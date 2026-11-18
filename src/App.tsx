@@ -120,15 +120,37 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
 
   const room = useRoomContext(); const participants = useParticipants(); const {localParticipant}=useLocalParticipant();
 
-  const [messages,setMessages]=useState<ChatMessage[]>([]); const [draft,setDraft]=useState(''); const [url,setUrl]=useState(''); const [videoId,setVideoId]=useState(''); const [playing,setPlaying]=useState(false); const [notice,setNotice]=useState(''); const [screenOn,setScreenOn]=useState(false); const [screenTrack,setScreenTrack]=useState<Track|null>(null); const [copied,setCopied]=useState(false);
+  const [messages,setMessages]=useState<ChatMessage[]>([]); const [draft,setDraft]=useState(''); const [url,setUrl]=useState(''); const [videoId,setVideoId]=useState(''); const [playing,setPlaying]=useState(false); const [notice,setNotice]=useState(''); const [screenOn,setScreenOn]=useState(false); const [screenTrack,setScreenTrack]=useState<Track|null>(null); const [copied,setCopied]=useState(false); const [volume,setVolume]=useState(100); const latestControl=useRef<any>(null); const playerReady=useRef(false);
 
   const chatEnd=useRef<HTMLDivElement>(null); const stageRef=useRef<HTMLDivElement>(null); const player=useRef<any>(null); const [expanded,setExpanded]=useState(false); const [nativeFullscreen,setNativeFullscreen]=useState(false); const isHost=credentials.isHost || room.localParticipant.identity===participants[0]?.identity;
 
   const connection=useConnectionState(); const [reconnectError,setReconnectError]=useState('');
 
-  useEffect(()=>{ const handler=(payload:Uint8Array)=>{try{const data=JSON.parse(new TextDecoder().decode(payload)); if(data.type==='chat')setMessages(m=>[...m,data.message]); if(data.type==='video'){setVideoId(data.videoId);setUrl(data.url);setPlaying(false);} if(data.type==='control'){setPlaying(data.playing); if(player.current&&data.videoId===videoId){data.playing?player.current.playVideo?.():player.current.pauseVideo?.();player.current.seekTo?.(data.time,true);}} if(data.type==='system')setMessages(m=>[...m,{id:crypto.randomUUID(),name:'WatchTogether',text:data.text,time:new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),system:true}]);}catch{} };
-
-    room.on(RoomEvent.DataReceived,handler); return()=>{room.off(RoomEvent.DataReceived,handler);};},[room,videoId]);
+  useEffect(()=>{
+    const handler=(payload:Uint8Array)=>{
+      try {
+        const data=JSON.parse(new TextDecoder().decode(payload));
+        if(data.type==='chat') setMessages(m=>[...m,data.message]);
+        if(data.type==='video'){latestControl.current=null;setVideoId(data.videoId);setUrl(data.url);setPlaying(false);}
+        if(data.type==='control' && data.videoId===videoId){
+          latestControl.current=data;setPlaying(Boolean(data.playing));
+          const yt=player.current;
+          if(yt && playerReady.current){
+            const elapsed=data.playing&&data.sentAt?Math.max(0,(Date.now()-data.sentAt)/1000):0;
+            const target=Number(data.time||0)+elapsed;
+            const current=Number(yt.getCurrentTime?.()||0);
+            if(Math.abs(current-target)>1.25) yt.seekTo?.(target,true);
+            const state=yt.getPlayerState?.();
+            if(data.playing && state!==1) yt.playVideo?.();
+            if(!data.playing && state!==2 && state!==0) yt.pauseVideo?.();
+          }
+        }
+        if(data.type==='system') setMessages(m=>[...m,{id:crypto.randomUUID(),name:'WatchTogether',text:data.text,time:new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),system:true}]);
+      } catch(error) { console.warn('Mensagem da sala inválida:',error); }
+    };
+    room.on(RoomEvent.DataReceived,handler);
+    return()=>{room.off(RoomEvent.DataReceived,handler);};
+  },[room,videoId]);
 
   useEffect(()=>{chatEnd.current?.scrollIntoView({behavior:'smooth'});},[messages]);
 
@@ -146,7 +168,64 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
 
   }
 
-  useEffect(()=>{ if(!videoId)return; const load=()=>{if((window as any).YT?.Player){ if(player.current?.destroy)player.current.destroy(); player.current=new (window as any).YT.Player('youtube-player',{videoId,playerVars:{autoplay:0,controls:1,rel:0},events:{onStateChange:(e:any)=>{if(isHost&&(e.data===1||e.data===2)){setPlaying(e.data===1);send({type:'control',playing:e.data===1,time:e.target.getCurrentTime(),videoId});}}}});}}; if(!(window as any).YT){const s=document.createElement('script');s.src='https://www\.youtube.com/iframe_api';document.body.appendChild(s);(window as any).onYouTubeIframeAPIReady=load;}else load(); return()=>{player.current?.destroy?.();player.current=null;};},[videoId]);
+  useEffect(()=>{
+    if(!videoId)return;
+    let cancelled=false;
+    const load=()=>{
+      if(cancelled || !(window as any).YT?.Player)return;
+      player.current?.destroy?.();playerReady.current=false;
+      player.current=new (window as any).YT.Player('youtube-player',{
+        videoId,
+        playerVars:{autoplay:0,controls:1,rel:0,playsinline:1,enablejsapi:1},
+        events:{
+          onReady:(event:any)=>{
+            playerReady.current=true;
+            const initial=latestControl.current;
+            if(initial){
+              const elapsed=initial.playing&&initial.sentAt?Math.max(0,(Date.now()-initial.sentAt)/1000):0;
+              const target=Number(initial.time||0)+elapsed;
+              if(Math.abs(Number(event.target.getCurrentTime?.()||0)-target)>1.25)event.target.seekTo?.(target,true);
+              if(initial.playing)event.target.playVideo?.();else event.target.pauseVideo?.();
+            }
+            try{event.target.setVolume?.(volume);}catch{}
+          },
+          onStateChange:(event:any)=>{
+            if(isHost&&(event.data===1||event.data===2)){
+              const next=event.data===1;setPlaying(next);
+              send({type:'control',playing:next,time:event.target.getCurrentTime(),videoId,sentAt:Date.now()});
+            }
+          }
+        }
+      });
+    };
+    if((window as any).YT?.Player)load();
+    else{
+      let script=document.querySelector('script[data-watchtogether-youtube]') as HTMLScriptElement|null;
+      if(!script){script=document.createElement('script');script.src='https://www.youtube.com/iframe_api';script.dataset.watchtogetherYoutube='true';document.body.appendChild(script);}
+      const previous=(window as any).onYouTubeIframeAPIReady;
+      (window as any).onYouTubeIframeAPIReady=()=>{previous?.();load();};
+    }
+    return()=>{cancelled=true;playerReady.current=false;player.current?.destroy?.();player.current=null;};
+  },[videoId]);
+
+  // Volume aplicado apenas aos elementos de áudio deste navegador/dispositivo.
+  useEffect(()=>{
+    const applyVolume=()=>{document.querySelectorAll('audio').forEach(element=>{(element as HTMLAudioElement).volume=volume/100;});try{player.current?.setVolume?.(volume);}catch{}};
+    applyVolume();
+    const observer=new MutationObserver(applyVolume);observer.observe(document.body,{childList:true,subtree:true});
+    return()=>observer.disconnect();
+  },[volume,videoId]);
+
+  // Heartbeat do anfitrião: corrige diferenças de tempo e estado nos demais players.
+  useEffect(()=>{
+    if(!isHost||!videoId)return;
+    const interval=window.setInterval(()=>{
+      const yt=player.current;if(!yt||!playerReady.current)return;
+      const state=yt.getPlayerState?.();
+      send({type:'control',playing:state===1||state===3,time:Number(yt.getCurrentTime?.()||0),videoId,sentAt:Date.now(),heartbeat:true});
+    },2000);
+    return()=>window.clearInterval(interval);
+  },[isHost,videoId,room]);
 
   function send(data:any){room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(data)),{reliable:true});}
 
@@ -182,13 +261,15 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
 
       }
 
-      setScreenTrack(tracks.find(track=>track.kind===Track.Kind.Video)||null);
-
-      setScreenOn(true);
+      const capturedAudio=tracks.some(track=>track.kind===Track.Kind.Audio);
+      const capturedVideo=tracks.find(track=>track.kind===Track.Kind.Video)||null;
+      setScreenTrack(capturedVideo);
+      setScreenOn(Boolean(capturedVideo));
+      capturedVideo?.mediaStreamTrack.addEventListener('ended',()=>{setScreenOn(false);setScreenTrack(null);});
 
       send({type:'system',text:`${credentials.participantName} começou a compartilhar a tela em alta qualidade.`});
 
-      setNotice('Compartilhamento em alta qualidade ativado. A resolução final depende do navegador, dispositivo e conexão.');
+      setNotice(capturedAudio?'Tela compartilhada com áudio. O navegador só captura som quando a opção de compartilhar áudio está disponível e selecionada.':'Tela compartilhada, mas sem faixa de áudio. Encerre e compartilhe novamente marcando “Compartilhar áudio” (ou “Compartilhar áudio da guia” no Chrome/Edge).');
 
     }catch(error){
 
@@ -218,7 +299,7 @@ function WatchRoom({credentials,onLeave}:{credentials:Credentials;onLeave:()=>vo
 
     </div>
 
-    <div className="toolbar"><div className="toolbar-left"><span className={`connection ${connection===ConnectionState.Connected?'ok':''}`}/><span>{connection===ConnectionState.Connected?'Conectado': 'Conectando...'}</span><span className="divider-v"/><Users size={15}/><span>{participants.length}/10</span></div><div className="toolbar-right">{screenOn?<button className="danger" onClick={stopScreen}><X size={16}/> Parar compartilhamento</button>:<button className="control" onClick={shareScreen}><MonitorUp size={17}/> Compartilhar tela</button>}<span className="audio-status"><Volume2 size={16}/> Áudio da sala ativo</span></div></div>
+    <div className="toolbar"><div className="toolbar-left"><span className={`connection ${connection===ConnectionState.Connected?'ok':''}`}/><span>{connection===ConnectionState.Connected?'Conectado': 'Conectando...'}</span><span className="divider-v"/><Users size={15}/><span>{participants.length}/10</span></div><div className="toolbar-right">{screenOn?<button className="danger" onClick={stopScreen}><X size={16}/> Parar compartilhamento</button>:<button className="control" onClick={shareScreen}><MonitorUp size={17}/> Compartilhar tela</button>}<label className="local-volume" title="Volume somente neste dispositivo"><Volume2 size={16}/><input aria-label="Volume local" type="range" min={0} max={100} value={volume} onChange={e=>setVolume(Number(e.target.value))}/><span>{volume}%</span></label><span className="audio-status">Áudio local</span></div></div>
 
     <div className="link-panel"><div className="link-title"><Play size={16}/> <b>Assistir por link</b><small>YouTube sincronizado</small></div><div className="link-input"><input id="video-link" value={url} onChange={e=>setUrl(e.target.value)} onKeyDown={e=>e.key==='Enter'&&addVideo()} placeholder="Cole o link do YouTube aqui..."/><button className="primary" onClick={addVideo}>Adicionar</button></div>{notice&&<div className="notice">{notice}</div>}</div>
 
